@@ -1,0 +1,255 @@
+#!/bin/bash
+
+PROXY_HOST="127.0.0.1"
+PROXY_PORT="7890"
+PROXY_URL="http://${PROXY_HOST}:${PROXY_PORT}"
+PROXY_CONF="/etc/systemd/system/docker.service.d/http-proxy.conf"
+ENV_FILE="/etc/environment"
+YUM_CONF="/etc/yum.conf"
+APT_CONF="/etc/apt/apt.conf.d/95proxy"
+PIP_CONF="$HOME/.pip/pip.conf"
+
+# ========== 颜色 ==========
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# ========== 各组件开启 ==========
+
+on_docker() {
+    sudo mkdir -p /etc/systemd/system/docker.service.d
+    sudo tee "${PROXY_CONF}" > /dev/null <<EOF
+[Service]
+Environment="HTTP_PROXY=${PROXY_URL}"
+Environment="HTTPS_PROXY=${PROXY_URL}"
+Environment="NO_PROXY=localhost,127.0.0.1"
+EOF
+    sudo systemctl daemon-reload && sudo systemctl restart docker
+}
+
+on_env() {
+    sudo sed -i '/^HTTP_PROXY\|^HTTPS_PROXY\|^http_proxy\|^https_proxy\|^NO_PROXY\|^no_proxy/d' "${ENV_FILE}"
+    sudo tee -a "${ENV_FILE}" > /dev/null <<EOF
+HTTP_PROXY="${PROXY_URL}"
+HTTPS_PROXY="${PROXY_URL}"
+http_proxy="${PROXY_URL}"
+https_proxy="${PROXY_URL}"
+NO_PROXY="localhost,127.0.0.1"
+no_proxy="localhost,127.0.0.1"
+EOF
+}
+
+on_yum() {
+    sudo sed -i '/^proxy=/d' "${YUM_CONF}"
+    echo "proxy=${PROXY_URL}" | sudo tee -a "${YUM_CONF}" > /dev/null
+}
+
+on_apt() {
+    sudo tee "${APT_CONF}" > /dev/null <<EOF
+Acquire::http::Proxy "${PROXY_URL}";
+Acquire::https::Proxy "${PROXY_URL}";
+EOF
+}
+
+on_npm() {
+    npm config set proxy "${PROXY_URL}"
+    npm config set https-proxy "${PROXY_URL}"
+}
+
+on_pip() {
+    mkdir -p "$HOME/.pip"
+    tee "${PIP_CONF}" > /dev/null <<EOF
+[global]
+proxy = ${PROXY_URL}
+EOF
+}
+
+on_git() {
+    git config --global http.proxy "${PROXY_URL}"
+    git config --global https.proxy "${PROXY_URL}"
+}
+
+on_wget() {
+    sudo sed -i '/^http_proxy\|^https_proxy\|^use_proxy/d' /etc/wgetrc
+    sudo tee -a /etc/wgetrc > /dev/null <<EOF
+http_proxy = ${PROXY_URL}
+https_proxy = ${PROXY_URL}
+use_proxy = on
+EOF
+}
+
+# ========== 各组件关闭 ==========
+
+off_docker() {
+    sudo rm -f "${PROXY_CONF}"
+    sudo systemctl daemon-reload && sudo systemctl restart docker
+}
+
+off_env()  { sudo sed -i '/^HTTP_PROXY\|^HTTPS_PROXY\|^http_proxy\|^https_proxy\|^NO_PROXY\|^no_proxy/d' "${ENV_FILE}"; }
+off_yum()  { sudo sed -i '/^proxy=/d' "${YUM_CONF}"; }
+off_apt()  { sudo rm -f "${APT_CONF}"; }
+off_npm()  { npm config delete proxy 2>/dev/null; npm config delete https-proxy 2>/dev/null; }
+off_pip()  { rm -f "${PIP_CONF}"; }
+off_git()  { git config --global --unset http.proxy 2>/dev/null; git config --global --unset https.proxy 2>/dev/null; }
+off_wget() { sudo sed -i '/^http_proxy\|^https_proxy\|^use_proxy/d' /etc/wgetrc; }
+
+# ========== 状态检测 ==========
+
+status_docker() { sudo systemctl show --property=Environment docker 2>/dev/null | grep -q "PROXY" && echo "on" || echo "off"; }
+status_env()    { grep -q "HTTP_PROXY" "${ENV_FILE}" 2>/dev/null && echo "on" || echo "off"; }
+status_yum()    { grep -q "^proxy=" "${YUM_CONF}" 2>/dev/null && echo "on" || echo "off"; }
+status_apt()    { [ -f "${APT_CONF}" ] && echo "on" || echo "off"; }
+status_npm()    { npm config get proxy 2>/dev/null | grep -q "http" && echo "on" || echo "off"; }
+status_pip()    { [ -f "${PIP_CONF}" ] && echo "on" || echo "off"; }
+status_git()    { git config --global --get http.proxy 2>/dev/null | grep -q "http" && echo "on" || echo "off"; }
+status_wget()   { grep -q "^http_proxy" /etc/wgetrc 2>/dev/null && echo "on" || echo "off"; }
+
+status_label() { [ "$1" = "on" ] && echo -e "${GREEN}[已开启]${NC}" || echo -e "${RED}[未设置]${NC}"; }
+
+# ========== 动态构建可用组件列表 ==========
+# 每项格式: "key|显示名称"
+# 只加入实际已安装的组件
+
+build_components() {
+    COMPONENTS=()
+    COMPONENTS+=("env|系统环境变量")
+    command -v docker &>/dev/null && COMPONENTS+=("docker|Docker")
+    command -v yum    &>/dev/null && COMPONENTS+=("yum|YUM")
+    command -v apt    &>/dev/null && COMPONENTS+=("apt|APT")
+    command -v npm    &>/dev/null && COMPONENTS+=("npm|NPM")
+    { command -v pip &>/dev/null || command -v pip3 &>/dev/null; } && COMPONENTS+=("pip|PIP")
+    command -v git    &>/dev/null && COMPONENTS+=("git|GIT")
+    command -v wget   &>/dev/null && COMPONENTS+=("wget|WGET")
+}
+
+# ========== 交互选择 ==========
+
+show_menu() {
+    local mode=$1
+    [ "${mode}" = "on" ] && local title="开启代理" || local title="关闭代理"
+
+    echo ""
+    echo -e "${BOLD}${BLUE}===== ${title} - 请选择组件 =====${NC}"
+    echo ""
+    echo -e "  ${BOLD}序号  组件              状态${NC}"
+    echo    "  ─────────────────────────────────────────"
+
+    local i=1
+    for item in "${COMPONENTS[@]}"; do
+        local key="${item%%|*}"
+        local name="${item##*|}"
+        local st
+        st=$(status_${key})
+        printf "  %d)    %-16s  %b\n" "${i}" "${name}" "$(status_label ${st})"
+        ((i++))
+    done
+
+    echo    "  ─────────────────────────────────────────"
+    echo -e "  ${BOLD}a)${NC}    全选"
+    echo -e "  ${BOLD}q)${NC}    返回主菜单"
+    echo ""
+    echo -e "  输入序号（多个用空格分隔，如 ${YELLOW}1 2 3${NC}），或输入 ${YELLOW}a${NC} 全选："
+    echo -n "  > "
+}
+
+parse_and_run() {
+    local mode=$1
+    local input=$2
+    local selected=()
+
+    if [ "${input}" = "a" ]; then
+        selected=("${COMPONENTS[@]}")
+    else
+        for n in ${input}; do
+            if [[ "${n}" =~ ^[0-9]+$ ]] && [ "${n}" -ge 1 ] && [ "${n}" -le "${#COMPONENTS[@]}" ]; then
+                selected+=("${COMPONENTS[$((n-1))]}")
+            fi
+        done
+    fi
+
+    [ ${#selected[@]} -eq 0 ] && echo -e "${YELLOW}  未选择任何组件。${NC}" && return
+
+    echo ""
+    for item in "${selected[@]}"; do
+        local key="${item%%|*}"
+        local name="${item##*|}"
+        echo -n "  处理 ${BOLD}${name}${NC} ... "
+        ${mode}_${key} 2>/dev/null && echo -e "${GREEN}✓${NC}" || echo -e "${RED}✗ 出错${NC}"
+    done
+
+    echo ""
+    echo -e "  ${GREEN}完成！${NC}"
+    [ "${mode}" = "on" ] && echo -e "  ${YELLOW}提示：系统环境变量需重新登录 shell 后生效。${NC}"
+    echo ""
+    read -rp "  按 Enter 返回主菜单..." _
+}
+
+proxy_interactive() {
+    local mode=$1
+
+    if [ "${mode}" = "on" ]; then
+        echo -e "  ${CYAN}>>> 检测代理 ${PROXY_URL} ...${NC}"
+        if ! curl -s --max-time 3 --proxy "${PROXY_URL}" https://www.google.com -o /dev/null 2>&1; then
+            echo -e "  ${RED}>>> 代理不可用，请检查代理服务是否启动${NC}"
+            echo ""
+            read -rp "  按 Enter 返回主菜单..." _
+            return
+        fi
+        echo -e "  ${GREEN}>>> 代理可用${NC}"
+    fi
+
+    build_components
+    show_menu "${mode}"
+    read -r input
+    [ "${input}" = "q" ] && return
+    parse_and_run "${mode}" "${input}"
+}
+
+proxy_status() {
+    build_components
+    echo ""
+    echo -e "${BOLD}${BLUE}===== 当前各组件代理状态 =====${NC}"
+    echo ""
+    for item in "${COMPONENTS[@]}"; do
+        local key="${item%%|*}"
+        local name="${item##*|}"
+        printf "  %-16s  %b\n" "${name}" "$(status_label $(status_${key}))"
+    done
+    echo ""
+    read -rp "  按 Enter 返回主菜单..." _
+}
+
+# ========== 主菜单 ==========
+
+main_menu() {
+    while true; do
+        clear
+        echo ""
+        echo -e "${BOLD}${BLUE}╔══════════════════════════════════╗${NC}"
+        echo -e "${BOLD}${BLUE}║      Linux 代理一键管理脚本      ║${NC}"
+        echo -e "${BOLD}${BLUE}╚══════════════════════════════════╝${NC}"
+        echo ""
+        echo -e "  代理地址: ${CYAN}${PROXY_URL}${NC}"
+        echo ""
+        echo -e "  ${BOLD}1)${NC}  开启代理（交互式选择组件）"
+        echo -e "  ${BOLD}2)${NC}  关闭代理（交互式选择组件）"
+        echo -e "  ${BOLD}3)${NC}  查看当前状态"
+        echo -e "  ${BOLD}q)${NC}  退出"
+        echo ""
+        echo -n "  请选择 > "
+        read -r choice
+        case "${choice}" in
+            1) proxy_interactive on  ;;
+            2) proxy_interactive off ;;
+            3) proxy_status          ;;
+            q) echo "" && echo -e "  再见！" && echo "" && exit 0 ;;
+            *) echo -e "${RED}  无效输入，请重试${NC}" && sleep 1 ;;
+        esac
+    done
+}
+
+main_menu
